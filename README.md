@@ -5,6 +5,19 @@
 
 Bypass Discord's upload limit without Nitro. Big File Upload sends the files Discord would refuse to an external host (Catbox, GoFile, an S3 bucket, your own Zipline, WebDAV or ShareX server, and more) and pastes the link into chat. Everything else stays a normal attachment.
 
+## About this fork
+
+Fork of [ScattrdBlade/bigFileUpload](https://github.com/ScattrdBlade/bigFileUpload), maintained by [DankyoDev](https://github.com/DankyoDev).
+
+What this fork changes:
+
+- **Clipboard capture for images and videos.** Ctrl+V works even when Discord's own paste path does nothing, which is the case in channels where attachments are disabled.
+- **Native attachments when possible.** If the channel allows *Attach Files* and the file is within Discord's limit, the paste stays in Discord and nothing is uploaded to an external host. The host is only used when the channel blocks attachments or the file is over the limit.
+- **Scoped diagnostic log.** Every decision is appended to `Vencord/logs/bigFileUpload.log` with a timestamp and a build tag: paste events, permission checks, the size gate, the attachment interceptor, the queue, each host attempt and where the link ends up. The file rotates at 2 MB. Message text and credentials are never written to it.
+- **Fix:** media pasted in a channel without *Attach Files* is uploaded instead of being silently discarded.
+
+Only images and videos are taken from the clipboard; text, documents and archives keep Discord's normal behaviour.
+
 ## Features
 
 - **Upload** from `+` → **Upload to Host**, right-click **Upload to \<host>** on media or links, or by taking over Discord's upload button, drag & drop and paste.
@@ -48,7 +61,7 @@ You can either **git clone** the repository OR **manually install** it by downlo
 The full cloning installation guide can be found [here](https://discord.com/channels/1015060230222131221/1257038407503446176/1257038407503446176) or via [the official Vencord Docs](https://docs.vencord.dev/installing/custom-plugins/).
 
 1. Direct your terminal (command prompt/CMD) to the `userplugins` folder, e.g. `cd src/userplugins`.
-2. Open the terminal and paste `git clone https://github.com/ScattrdBlade/bigFileUpload`
+2. Open the terminal and paste `git clone https://github.com/DankyoDev/bigFileUpload`
 3. Ensure it's structured as `src/userplugins/bigFileUpload` or `src/userplugins/bigFileUpload-main`
 4. Run `pnpm build` in the terminal (command prompt/CMD) and the plugin should be added.
 
@@ -240,7 +253,7 @@ FileUpload, AutoZipper and Encryptcord take the same uploads. BigFileUpload warn
 
 1. **Update first:** rebuild Vencord (`pnpm build`) and fully restart Discord.
 2. **Reproduce the problem**, then copy the console lines (Ctrl+Shift+I → Console, filter `BigFileUpload`).
-3. **Open an issue** at https://github.com/ScattrdBlade/bigFileUpload/issues saying what you did, expected and got, with those lines. Remove any tokens or private links first.
+3. **Open an issue** at https://github.com/DankyoDev/bigFileUpload/issues saying what you did, expected and got, with those lines. Remove any tokens or private links first.
 
 ## The CORS-proxy question
 

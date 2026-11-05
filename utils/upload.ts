@@ -12,6 +12,7 @@ import { chooseFile } from "@utils/web";
 import { ChannelSectionStore, ChannelStore, DraftType, MessageActions, PermissionsBits, PermissionStore, SelectedChannelStore, showToast, UserStore } from "@webpack/common";
 
 import { ensureMigrated, getStripQueryMode, settings, withDeclaredDefaults } from "../settings";
+import { trace } from "../debugLog";
 import { bodySize, buildShareXHeaders, credentialProblems, CredentialValues, DEFAULT_ACTIVE_FALLBACKS, describeProxy, directWebHostNames, fallbackServiceOrder, fallsBackToPublic, fileTypePasses, findProxyPreset, hasConfiguredCredential, isGenericWebdav, isPrivateFallbackTarget, isProxiedThrough, isWorkersProxy, listNames, logger, normalizeActiveFallbacks, parseEncryptingHostDomains, parseFileTypeFilter, parseShareXConfig, PIXELDRAIN_KEY_REQUIRED, proxyBodyLimit, proxyKey, resolveShareXRequestValue, resolveShareXTemplate, serviceLabel, SERVICES, ServiceType, ShareXUploaderConfig, TMPFILES_KEPT, toProxiedUrl, TRACKING_QUERY_KEYS, validateShareXConfig, ZEROX0_KEPT } from "../types";
 import { announceLateCancel, askOriginRetry, askTakeover, askToUseHost, LateCancelEntry, LateCancelError, notifyBlockedHost, notifyTakeover, openPluginSettings, UploadCancelledError } from "./dialogs";
 import { ByteSource, convertApngToGif, getExtensionFromBytes, getExtensionFromMime, getMimeFromExtension, getUrlExtension, isOggVideo } from "./media";
@@ -972,7 +973,9 @@ let droppedJobs = 0;
 
 function enqueueUpload(name: string, run: UploadJob["run"], fileNames: readonly string[], size: number | null = null): Promise<boolean> {
     return new Promise(resolve => {
-        uploadQueue.push({ run, resolve, queuedBehind: pumping, fileNames, id: nextJobId++, name, size });
+        const job: UploadJob = { run, resolve, queuedBehind: pumping, fileNames, id: nextJobId++, name, size };
+        uploadQueue.push(job);
+        trace("queue", `queued #${job.id} ${name} (${fileNames.join(", ")})${pumping ? ", behind the running upload" : ""}`);
         if (pumping) {
             setUploadState(queueState());
             showToast({ text: `Queued ${name}. It uploads when the current upload is done` });
@@ -990,6 +993,7 @@ async function pumpUploads(): Promise<void> {
             staleOtherOffers(job);
             currentJob = job;
             let ok = false;
+            trace("queue", `starting #${job.id} ${job.name}`);
             try {
                 ok = await job.run(job);
             } catch (error) {
@@ -997,6 +1001,7 @@ async function pumpUploads(): Promise<void> {
             } finally {
                 currentJob = null;
             }
+            trace("queue", `finished #${job.id} ${job.name}: ${ok ? "ok" : "failed or cancelled"}`);
             job.resolve(ok);
         }
     } finally {
@@ -3928,6 +3933,7 @@ interface UploadLinks {
 async function notifyUploadSuccess({ plain, wrapped: finalUrl }: UploadLinks, target: UploadTarget, displayName?: string, batch?: BatchLinks, spoiler = false): Promise<void> {
     const preformatted = isPreformattedLink(finalUrl);
     let placed = placeLink(target);
+    trace("link", `${finalUrl} -> ${placed} (channel=${target.channelId ?? "?"}, autoSend=${settings.store.autoSend})`);
 
     const { autoFormat, displayOriginalFilename } = settings.store;
     let text = finalUrl;
@@ -4218,6 +4224,7 @@ async function uploadWithFallbacks(fileBlob: UploadBody, filename: string, prima
     const ordered = attemptOrder(primary, plan);
     const uploadOrder = rerun ? ordered.filter(s => s === rerun) : ordered;
     const moved = !rerun && uploadOrder[0] !== plan.order[0];
+    trace("host", `primary=${serviceLabel(primary)} order=[${uploadOrder.map(serviceLabel).join(", ")}]${plan.skipped.length ? ` skipped=[${plan.skipped.map(s => `${serviceLabel(s.service)}: ${s.reason}`).join("; ")}]` : ""}`);
 
     if (!uploadOrder.length) {
         const message = rerun ? `${serviceLabel(rerun)} can no longer take ${displayName}` : noHostMessage(primary, file, plan);
@@ -4323,6 +4330,8 @@ async function uploadWithFallbacks(fileBlob: UploadBody, filename: string, prima
 
         const attempt = attempted.length + 1;
 
+        trace("host", `trying ${serviceLabel(service)} (${attempt}/${uploadOrder.length}) for ${displayName}`);
+
         setUploadState({
             phase: attempt === 1 ? "uploading" : "retrying",
             attempt,
@@ -4388,6 +4397,8 @@ async function uploadWithFallbacks(fileBlob: UploadBody, filename: string, prima
                     canCancel: false
                 });
 
+                trace("host", `success via ${serviceLabel(service)}: ${url}`);
+
                 return { url, service, kept: keptNow() };
             } catch (error) {
                 if (error instanceof CommittedUploadError) {
@@ -4397,6 +4408,7 @@ async function uploadWithFallbacks(fileBlob: UploadBody, filename: string, prima
                 if (isUploadCancelledError(error) || error instanceof SpoolError) {
                     throw error;
                 }
+                trace("host", `${serviceLabel(service)} failed: ${error instanceof Error ? error.message : String(error)}`);
                 const status = (lastOutcome as RequestOutcome | null)?.status ?? 0;
                 if (attemptProxy as AttemptProxy | null && status >= 200 && status < 300 && !(error instanceof TransportError) && !(error instanceof RateLimitError)
                     && SERVICES[service].privacy === "public") {
@@ -4874,8 +4886,10 @@ export async function uploadPickedFile(target: UploadTarget = { channelId: Selec
 }
 
 export async function uploadProvidedFiles(files: readonly File[], target: UploadTarget = { channelId: SelectedChannelStore.getChannelId() }): Promise<boolean> {
+    trace("upload", `requested: [${files.map(f => `${f.name || f.type}(${f.size})`).join(", ")}] channel=${target.channelId ?? "?"} automatic=${Boolean(target.automatic)}`);
     const blocked = uploadBlocker();
     if (blocked) {
+        trace("upload", `blocked: ${blocked}`);
         showToast({ text: blocked, variant: "critical", duration: 8000 });
         return false;
     }
@@ -4883,7 +4897,10 @@ export async function uploadProvidedFiles(files: readonly File[], target: Upload
     if (!files.length) return false;
 
     const uploadFiles = files.filter(file => Boolean(file) && (target.confirmed || isFileTypeAllowed(file)));
-    if (!uploadFiles.length) return false;
+    if (!uploadFiles.length) {
+        trace("upload", "skipped: no file passes the Allowed File Types filter");
+        return false;
+    }
 
     const name = uploadFiles.length > 1 ? `${uploadFiles.length} files` : uploadFiles[0].name || "the file";
     return enqueueUpload(name, job => runFilesUpload(uploadFiles, target, job), uploadFiles.map(f => f.name), uploadFiles.reduce((sum, f) => sum + f.size, 0));

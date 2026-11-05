@@ -9,7 +9,7 @@ import { subscribe } from "diagnostics_channel";
 import { lookup } from "dns/promises";
 import { IpcMainInvokeEvent, WebContents } from "electron";
 import { constants, rmSync } from "fs";
-import { FileHandle, lstat, mkdir, open, readdir, stat, statfs, unlink } from "fs/promises";
+import { appendFile, FileHandle, lstat, mkdir, open, readdir, stat, statfs, unlink } from "fs/promises";
 import { isIP } from "net";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -17,6 +17,24 @@ import { join } from "path";
 import { classifyFetchError, classifyHttpBlock, describeNetworkError, firstErrorCode, httpHostKind, httpLanOnlyText, isDnsCode, isPrivateAddress, isPublicSourceAddress, NATIVE_MAX_BUFFER, NativeErrorCode, PROXY_RETRY_KINDS, RESPONSE_GRACE_MS, SPOOL_HEAD_BYTES, SPOOL_MAX_BYTES, SPOOL_SLICE_BYTES, SpoolSource, UploadAbortError, UploadFailure } from "./utils/shared";
 
 let uploadProgress: { loaded: number; total: number; phase?: "downloading"; } = { loaded: 0, total: 0 };
+
+const LOG_DIR = join(process.env.APPDATA ?? tmpdir(), "Vencord", "logs");
+
+const LOG_FILE = join(LOG_DIR, "bigFileUpload.log");
+
+const LOG_MAX_BYTES = 2 * 1024 * 1024;
+
+export async function appendLog(_: IpcMainInvokeEvent, line: string): Promise<void> {
+    try {
+        await mkdir(LOG_DIR, { recursive: true });
+        try {
+            if ((await stat(LOG_FILE)).size > LOG_MAX_BYTES) await unlink(LOG_FILE);
+        } catch { }
+        await appendFile(LOG_FILE, `${line}\n`, "utf8");
+    } catch (error) {
+        console.error("BigFileUpload: couldn't write the log file", error);
+    }
+}
 
 export async function getUploadProgress(_: IpcMainInvokeEvent): Promise<{ loaded: number; total: number; phase: "uploading" | "downloading"; stallWatch: true; }> {
     const { loaded, total, phase = "uploading" } = uploadProgress;

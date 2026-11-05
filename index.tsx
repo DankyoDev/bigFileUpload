@@ -21,6 +21,8 @@ import { ChannelStore, DraftType, EditMessageStore, FluxDispatcher, Menu, Permis
 import { migrateSettings, settings } from "./settings";
 import { listNames, serviceLabel, ServiceType } from "./types";
 import { askToUseHost, copyKeptLink, initCorsProxyPrompt, openPluginSettings, startCorsProxyPrompt } from "./utils/dialogs";
+import { trace } from "./debugLog";
+import { startPasteCapture, stopPasteCapture } from "./pasteCapture";
 import { getMediaUrls } from "./utils/media";
 import { loadHttpOrigins } from "./utils/proxy";
 import { canAnyHostAccept, cancelAllUploads, cancelCurrentUpload, dismissUploadState, formatSize, getUploadState, hasNativeHelper, isFileTypeAllowed, isPrimaryReady, logger, noHostText, offerHost, primaryNotReadyReason, primaryNotReadyText, removeQueuedUpload, subscribeUploadState, uploadBlocker, uploadFile, uploadPickedFile, uploadProvidedFiles, UploadTarget } from "./utils/upload";
@@ -284,6 +286,16 @@ function showPrimaryNotReadyToast(files: readonly File[], guildId: string | null
     showToast({ text: `BigFileUpload: ${primaryNotReadyText()}. Until then, files over Discord's limit are left to Discord`, variant: "critical", duration: 10000 });
 }
 
+function channelAcceptsAttachments(channel: Channel): boolean {
+    if (!channel.guild_id) return true;
+    try {
+        return PermissionStore.can(PermissionsBits.ATTACH_FILES, channel);
+    } catch (error) {
+        trace("gate", `couldn't read ATTACH_FILES for ${channel.id}: ${String(error)}`);
+        return false;
+    }
+}
+
 function isOriginEnabled(origin: unknown): boolean {
     if (origin === ACTIVITY_SHARE_ORIGIN) return false;
     if (origin === "clipboard") return settings.store.autoUploadPastedFiles;
@@ -327,40 +339,49 @@ interface GateCall {
     isThumbnail?: boolean;
 }
 
-function decideGateBypass({ files, guildId, channel, draftType, origin, isThumbnail }: GateCall): boolean {
-    if (!pluginActive || isThumbnail || !isOriginEnabled(origin) || !interceptorHealthy) return false;
-    if (!Array.isArray(files) || !files.length || !channel || draftType == null) return false;
-    if (draftType !== DraftType.ChannelMessage && draftType !== DraftType.FirstThreadMessage) return false;
-    if (isDeclinedBatch(channel.id, files.length, false)) return false;
+function decideGateBypass(call: GateCall): boolean {
+    const decision = gateDecision(call);
+    trace("gate", decision.ok ? "yes: taking the batch" : `no: ${decision.reason}`);
+    return decision.ok;
+}
+
+function gateDecision({ files, guildId, channel, draftType, origin, isThumbnail }: GateCall): { ok: boolean; reason?: string; } {
+    if (!pluginActive) return { ok: false, reason: "plugin inactive" };
+    if (isThumbnail) return { ok: false, reason: "thumbnail" };
+    if (!isOriginEnabled(origin)) return { ok: false, reason: `origin ${String(origin)} is disabled` };
+    if (!interceptorHealthy) return { ok: false, reason: "interceptor unhealthy" };
+    if (!Array.isArray(files) || !files.length || !channel || draftType == null) return { ok: false, reason: "incomplete call" };
+    if (draftType !== DraftType.ChannelMessage && draftType !== DraftType.FirstThreadMessage) return { ok: false, reason: "not a chat draft" };
+    if (isDeclinedBatch(channel.id, files.length, false)) return { ok: false, reason: "the same batch was just declined" };
 
     const gid = guildId ?? channel.guild_id ?? null;
-    if (!filesExceedDiscordLimit(files, gid)) return false;
+    if (!filesExceedDiscordLimit(files, gid)) return { ok: false, reason: "under Discord's limit" };
     if (!isPrimaryReady()) {
         if (discordShowsSizeModal(files, guildId ?? null)) {
             showPrimaryNotReadyToast(files, gid);
             const wanted = files.filter(f => isFileTypeAllowed(f) && filesExceedDiscordLimit([f], gid));
             if (wanted.length) offerUploadWith(wanted, { channelId: channel.id, draftType }, "notReady");
         }
-        return false;
+        return { ok: false, reason: "no host is ready" };
     }
     const homeless = filesNoHostAccepts(files, gid);
     if (homeless.length) {
         if (discordShowsSizeModal(files, guildId ?? null)) showNoHostToast(homeless);
-        return false;
+        return { ok: false, reason: `no host accepts ${homeless.length} of the files` };
     }
-    if (UploadAttachmentStore.getUploadCount(channel.id, draftType) + files.length > DISCORD_MAX_ATTACHMENTS) return false;
+    if (UploadAttachmentStore.getUploadCount(channel.id, draftType) + files.length > DISCORD_MAX_ATTACHMENTS) return { ok: false, reason: "too many attachments" };
     const existing = getDraftFiles(channel.id, draftType);
     const taken = pickFilesToTake(files, existing, gid, draftType, origin);
     const rest = files.filter(f => !taken.includes(f));
     if (!taken.length || (rest.length && filesExceedDiscordLimit([...existing, ...rest], gid))) {
         offerExcludedFiles(files, gid, guildId ?? null, channel.id, draftType);
-        return false;
+        return { ok: false, reason: "nothing to take, or the rest would still be over the limit" };
     }
 
     taken.forEach(f => bypassedFiles.add(f));
     lastBypassChannelId = channel.id;
     scheduleInterceptorHealthCheck();
-    return true;
+    return { ok: true };
 }
 
 function extractFilesFromValue(value: unknown): File[] {
@@ -427,9 +448,25 @@ function interceptUploadAddFiles(event: unknown): void {
         }
 
         const entries = Array.isArray(payload.files) ? payload.files : [];
-        if (isDeclinedBatch(payload.channelId, entries.length, true)) return;
-        if (!isOriginEnabled(entryField(entries[0], "origin"))) return;
+        if (entries.length || dispatched.length) {
+            trace("interceptor", `add-files: channel=${payload.channelId} draftType=${String(payload.draftType)} origin=${String(entryField(entries[0], "origin"))} files=[${dispatched.map(f => `${f.name || f.type}(${f.size})`).join(", ")}]`);
+        }
+        const origin = entryField(entries[0], "origin");
+        const payloadChannel = payload.channelId ? ChannelStore.getChannel(payload.channelId) : null;
+        if (origin === "clipboard" && payloadChannel && channelAcceptsAttachments(payloadChannel) && !filesExceedDiscordLimit(dispatched, getGuildIdForChannel(payload.channelId))) {
+            trace("interceptor", `skipped: Discord can attach in #${payloadChannel.name ?? payload.channelId}, leaving the pasted files to Discord`);
+            return;
+        }
+        if (isDeclinedBatch(payload.channelId, entries.length, true)) {
+            trace("interceptor", "skipped: the same batch was just declined");
+            return;
+        }
+        if (!isOriginEnabled(origin)) {
+            trace("interceptor", `skipped: origin ${String(origin)} is disabled`);
+            return;
+        }
         if (!isPrimaryReady()) {
+            trace("interceptor", "skipped: no host is ready");
             if (payload.draftType === DraftType.ChannelMessage || payload.draftType === DraftType.FirstThreadMessage) {
                 const thumbnails = new Set(extractFilesFromValue(entries.filter(e => entryField(e, "isThumbnail") === true)));
                 showPrimaryNotReadyToast(dispatched.filter(f => !thumbnails.has(f)), getGuildIdForChannel(payload.channelId));
@@ -438,6 +475,7 @@ function interceptUploadAddFiles(event: unknown): void {
         }
 
         if (payload.draftType !== DraftType.ChannelMessage && payload.draftType !== DraftType.FirstThreadMessage) {
+            trace("interceptor", `skipped: draft type ${String(payload.draftType)} is not a chat message`);
             if (dispatched.length && filesExceedDiscordLimit(dispatched, getGuildIdForChannel(payload.channelId))) {
                 showToast({ text: "BigFileUpload can't take this kind of upload (such as a poll). The file is over your Discord limit and may fail to send" });
             }
@@ -446,7 +484,10 @@ function interceptUploadAddFiles(event: unknown): void {
 
         const thumbnails = new Set(extractFilesFromValue(entries.filter(e => entryField(e, "isThumbnail") === true)));
         const allFiles = Array.from(new Set(dispatched)).filter(f => !thumbnails.has(f));
-        if (!allFiles.length) return;
+        if (!allFiles.length) {
+            trace("interceptor", "skipped: no files in the payload");
+            return;
+        }
         const pinned = new Set(extractFilesFromValue(entries.filter(e => entryField(e, "id") != null)));
 
         const guildId = getGuildIdForChannel(payload.channelId);
@@ -462,8 +503,8 @@ function interceptUploadAddFiles(event: unknown): void {
             showNoHostToast([...homeless]);
         }
 
-        const origin = entryField(entries[0], "origin");
         const toTake = pickFilesToTake(allFiles.filter(f => !pinned.has(f) && !homeless.has(f)), [...getDraftFiles(payload.channelId, payload.draftType), ...allFiles.filter(f => pinned.has(f))], guildId, payload.draftType, origin);
+        trace("interceptor", `take ${toTake.length}/${allFiles.length}${toTake.length ? ` -> ${toTake.map(f => f.name || f.type).join(", ")}` : " (leaving them to Discord)"}`);
         if (!toTake.length) return;
 
         removeFilesFromPayload(payload, new Set(toTake));
@@ -489,7 +530,12 @@ function decideIncomingFiles(files: File[], channel: Channel, draftType: number,
 function handleIncomingFiles(list: ArrayLike<File>, channel: Channel, draftType: number, origin: "clipboard" | "drag_drop", composer?: unknown): boolean {
     try {
         const files = Array.from(list);
+        if (origin === "clipboard" && files.length && channelAcceptsAttachments(channel) && !filesExceedDiscordLimit(files, channel.guild_id ?? null)) {
+            trace("hook", `Discord can attach in #${channel.name ?? channel.id}, leaving ${files.length} pasted file(s) to Discord`);
+            return false;
+        }
         const decision = decideIncomingFiles(files, channel, draftType, origin);
+        trace("hook", `discord ${origin} hook: ${files.length} file(s) -> ${decision}`);
         if (decision === "decline") declinedBatch = { channelId: channel.id, count: files.length, at: Date.now() };
         if (decision !== "take") return false;
         void uploadProvidedFiles(files, { channelId: channel.id, draftType, automatic: true, ...typeof composer === "string" && { composer } });
@@ -884,6 +930,8 @@ export default definePlugin({
             logger.error("Settings migration failed", error);
         }
         safely("The CORS-proxy start check", () => startCorsProxyPrompt(fresh));
+        safely("The clipboard capture", startPasteCapture);
+        trace("start", `respectLimit=${settings.store.bypassDiscordUploadOnlyOverLimit} upload=${settings.store.bypassDiscordUpload} drag=${settings.store.bypassDragDrop} paste=${settings.store.autoUploadPastedFiles}`);
 
         if (uploadAddFilesInterceptor) {
             return;
@@ -911,6 +959,7 @@ export default definePlugin({
         void loadHttpOrigins();
     },
     stop() {
+        stopPasteCapture();
         if (!uploadAddFilesInterceptor) {
             return;
         }
